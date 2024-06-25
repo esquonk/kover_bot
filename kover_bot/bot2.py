@@ -1,5 +1,5 @@
 import asyncio
-import concurrent.futures
+
 import random
 import re
 import logging
@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from reactivex.scheduler.eventloop import AsyncIOThreadSafeScheduler
 from reactivex.subject import Subject, BehaviorSubject
 from telegram import MessageEntity
-from telegram.error import NetworkError, Forbidden
+from telegram.error import NetworkError
 
 from kover_bot.rx_utils import skip_some
 
@@ -216,10 +216,14 @@ class KoverBot:
 
     async def get_updates_async(self):
         while True:
-            for update in await self.bot.get_updates(offset=self.update_id, timeout=10):
-                logger.debug(f"got update {update.update_id}")
-                self.update_id = update.update_id + 1
-                yield update
+            try:
+                for update in await self.bot.get_updates(offset=self.update_id, timeout=10):
+                    logger.debug(f"got update {update.update_id}")
+                    self.update_id = update.update_id + 1
+                    yield update
+            except NetworkError:
+                logger.exception("Error when calling bot.get_updates")
+                await asyncio.sleep(10)
 
     async def run(self):
         await self._setup()
@@ -233,13 +237,20 @@ class KoverBot:
         tries = 0
         comments = []
         while len(comments) == 0 and tries < 10:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://svalko.org/random.html") as response:
-                    content = await response.read()
-                    soup = BeautifulSoup(content, "html.parser")
-                    comments = [x for x in soup.find_all('div', {'class': 'comment'}) if
-                                len(x.text) < 500 and x.text.strip()]
-                    tries += 1
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get("https://svalko.org/random.html") as response:
+                        content = await response.read()
+                        soup = BeautifulSoup(content, "html.parser")
+                        comments = [x for x in soup.find_all('div', {'class': 'comment'}) if
+                                    len(x.text) < 500 and x.text.strip()]
+                        tries += 1
+            except aiohttp.ClientError:
+                await asyncio.sleep(1)
+                tries += 1
+
+        if not comments:
+            return ""
 
         comment = random.choice(comments).find('div', {'class': 'text'})
         return comment.text
