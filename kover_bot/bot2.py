@@ -1,8 +1,7 @@
 import asyncio
-
+import logging
 import random
 import re
-import logging
 import sys
 from asyncio import sleep
 from dataclasses import dataclass, field
@@ -12,10 +11,10 @@ from io import BytesIO
 import aiohttp
 import reactivex as rx
 import reactivex.operators as op
-from reactivex import Observable
-from reactivex.disposable import CompositeDisposable
 import telegram
 from bs4 import BeautifulSoup
+from reactivex import Observable
+from reactivex.disposable import CompositeDisposable
 from reactivex.scheduler.eventloop import AsyncIOThreadSafeScheduler
 from reactivex.subject import Subject, BehaviorSubject
 from telegram import MessageEntity
@@ -49,6 +48,7 @@ class KoverBot:
     ptaag_re = re.compile(r'\B(\#\w+\b)(?!;.)')
     svalko_re = re.compile(r"^javascript: image_view\(\'svalko\.org\', \'(.*?)\', \d+, \d+\);$")
     anek_re = re.compile(r'^.*анекдот.*$', re.IGNORECASE)
+    privet_re = re.compile(r'^о привет$', re.IGNORECASE)
 
     chats = BehaviorSubject({})
     updates = Subject()
@@ -179,6 +179,19 @@ class KoverBot:
             op.flat_map(lambda update: asyncio.create_task(self.send_anek(
                 update.message.chat_id, update.message.message_id
             ))),
+        ).subscribe(
+            on_next=lambda _: None,
+            scheduler=scheduler
+        )
+
+        # respond to o privet
+        messages.pipe(
+            op.filter(lambda update: bool(self.privet_re.match(update.message.text))),
+            op.debounce(20),
+            op.flat_map(lambda update: asyncio.create_task(self.bot.send_message(
+                chat_id=update.message.chat_id,
+                text="о привет")
+            )),
         ).subscribe(
             on_next=lambda _: None,
             scheduler=scheduler
