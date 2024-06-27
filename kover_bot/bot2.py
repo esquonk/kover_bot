@@ -18,7 +18,7 @@ from reactivex.disposable import CompositeDisposable
 from reactivex.scheduler.eventloop import AsyncIOThreadSafeScheduler
 from reactivex.subject import Subject, BehaviorSubject
 from telegram import MessageEntity
-from telegram.error import NetworkError
+from telegram.error import NetworkError, RetryAfter
 
 from kover_bot.rx_utils import skip_some
 
@@ -237,6 +237,9 @@ class KoverBot:
             except NetworkError:
                 logger.exception("Error when calling bot.get_updates")
                 await asyncio.sleep(10)
+            except RetryAfter as e:
+                logger.exception("RetryAfter when calling bot.get_updates")
+                await asyncio.sleep(e.retry_after + 1)
 
     async def run(self):
         await self._setup()
