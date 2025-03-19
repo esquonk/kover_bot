@@ -179,7 +179,6 @@ class KoverBot:
             ))),
         ).subscribe(
             on_next=lambda _: None,
-            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -191,7 +190,6 @@ class KoverBot:
             ))),
         ).subscribe(
             on_next=lambda _: None,
-            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -205,7 +203,6 @@ class KoverBot:
             )),
         ).subscribe(
             on_next=lambda _: None,
-            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -219,7 +216,6 @@ class KoverBot:
             ),
         ).subscribe(
             on_next=lambda _: None,
-            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -231,7 +227,6 @@ class KoverBot:
             op.retry(3)
         ).subscribe(
             on_next=lambda _: None,
-            on_error=self.on_error,
             scheduler=scheduler
         )
 
