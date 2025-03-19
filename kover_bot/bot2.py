@@ -293,7 +293,7 @@ class KoverBot:
 
     async def send_message(self, chat_id, text, reply_to_message_id=None):
         with handle_telegram_error():
-            self.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
+            await self.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
 
     async def send_anek(self, chat_id, reply_to_id):
         logger.info(f"send_anek, chat_id={chat_id}, reply_to_id={reply_to_id}")
