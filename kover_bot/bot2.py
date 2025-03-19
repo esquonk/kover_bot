@@ -4,6 +4,7 @@ import random
 import re
 import sys
 from asyncio import sleep
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from io import BytesIO
@@ -18,7 +19,7 @@ from reactivex.disposable import CompositeDisposable
 from reactivex.scheduler.eventloop import AsyncIOThreadSafeScheduler
 from reactivex.subject import Subject, BehaviorSubject
 from telegram import MessageEntity
-from telegram.error import NetworkError, RetryAfter
+from telegram.error import NetworkError, RetryAfter, TimedOut
 
 from kover_bot.rx_utils import skip_some
 
@@ -33,6 +34,14 @@ logging.basicConfig(
     level=logging.INFO,
     stream=sys.stdout
 )
+
+
+@contextmanager
+def handle_telegram_error():
+    try:
+        yield
+    except TimedOut:
+        logger.exception("Telegram error")
 
 
 @dataclass
@@ -139,7 +148,7 @@ class KoverBot:
         messages.pipe(
             skip_some(60, 180, 60, 120, partition=lambda update: update.message.chat.id),
             op.flat_map(lambda update: asyncio.create_task(get_response(update))),
-            op.flat_map(lambda args: asyncio.create_task(args[0].message.reply_text(args[1]))),
+            op.flat_map(lambda args: asyncio.create_task(self.send_reply(args[0].message, args[1]))),
         ).subscribe(
             on_next=lambda _: None,
             scheduler=scheduler
@@ -155,7 +164,7 @@ class KoverBot:
                 )
             )),
             op.flat_map(lambda update: asyncio.create_task(get_response(update))),
-            op.flat_map(lambda args: asyncio.create_task(args[0].message.reply_text(args[1]))),
+            op.flat_map(lambda args: asyncio.create_task(self.send_reply(args[0].message, args[1]))),
         ).subscribe(
             on_next=lambda _: None,
             scheduler=scheduler
@@ -170,6 +179,7 @@ class KoverBot:
             ))),
         ).subscribe(
             on_next=lambda _: None,
+            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -181,6 +191,7 @@ class KoverBot:
             ))),
         ).subscribe(
             on_next=lambda _: None,
+            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -188,12 +199,13 @@ class KoverBot:
         messages.pipe(
             op.filter(lambda update: bool(self.privet_re.match(update.message.text))),
             op.debounce(20),
-            op.flat_map(lambda update: asyncio.create_task(self.bot.send_message(
+            op.flat_map(lambda update: asyncio.create_task(self.send_message(
                 chat_id=update.message.chat_id,
                 text="о привет")
             )),
         ).subscribe(
             on_next=lambda _: None,
+            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -204,9 +216,10 @@ class KoverBot:
                     ''.join(message.text.split(maxsplit=1)[1:]).lower(),
                     message.chat_id, message.message_id
                 ))
-            )
+            ),
         ).subscribe(
             on_next=lambda _: None,
+            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -214,9 +227,11 @@ class KoverBot:
         self.command_obs('kament').pipe(
             op.flat_map(
                 lambda message: asyncio.create_task(self.send_kament(message.chat_id))
-            )
+            ),
+            op.retry(3)
         ).subscribe(
             on_next=lambda _: None,
+            on_error=self.on_error,
             scheduler=scheduler
         )
 
@@ -275,7 +290,15 @@ class KoverBot:
         logger.info(f"send_kament, chat_id={chat_id}")
 
         kament = await self.get_kament()
-        await self.bot.send_message(chat_id=chat_id, text=kament)
+        await self.send_message(chat_id=chat_id, text=kament)
+
+    async def send_reply(self, message, text):
+        with handle_telegram_error():
+            await message.reply_text(text)
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None):
+        with handle_telegram_error():
+            self.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
 
     async def send_anek(self, chat_id, reply_to_id):
         logger.info(f"send_anek, chat_id={chat_id}, reply_to_id={reply_to_id}")
@@ -285,9 +308,10 @@ class KoverBot:
                 soup = BeautifulSoup(await response.read(), "html.parser")
 
         anek = soup.find('section', {'class': 'anek-view'}).find('p').text
-        await self.bot.send_message(chat_id=chat_id,
-                                    reply_to_message_id=reply_to_id,
-                                    text=anek)
+
+        await self.send_message(chat_id=chat_id,
+                                reply_to_message_id=reply_to_id,
+                                text=anek)
 
     async def send_svalkopic(self, tag_query, chat_id, reply_to_id, fail_silent=False):
         logger.info(f"send_svalkopic, chat_id={chat_id}, reply_to_id={reply_to_id}")
@@ -303,9 +327,9 @@ class KoverBot:
 
                 if not tagtag:
                     if not fail_silent:
-                        await self.bot.send_message(chat_id=chat_id,
-                                                    reply_to_message_id=reply_to_id,
-                                                    text='Нет такого тага')
+                        await self.send_message(chat_id=chat_id,
+                                                reply_to_message_id=reply_to_id,
+                                                text='Нет такого тага')
                     return
 
                 tag_id = tagtag.attrs['href'].replace('/tag/', '')
@@ -331,13 +355,14 @@ class KoverBot:
                             async with session.get(pictag.attrs['src']) as response:
                                 b = BytesIO(await response.read())
 
-                            await self.bot.send_photo(chat_id=chat_id, photo=b,
-                                                      caption=post.text[:200])
+                            with handle_telegram_error():
+                                await self.bot.send_photo(chat_id=chat_id, photo=b,
+                                                          caption=post.text[:200])
                             success = True
                         except aiohttp.ClientError:
                             pass
                     else:
-                        await self.bot.send_message(chat_id=chat_id, text=post.text)
+                        await self.send_message(chat_id=chat_id, text=post.text)
                         success = True
 
             else:
@@ -353,4 +378,6 @@ class KoverBot:
                         f"https://svalko.org/data/{name}"
                 ) as response:
                     b = BytesIO(await response.read())
-                await self.bot.send_photo(chat_id=chat_id, photo=b)
+
+                with handle_telegram_error():
+                    await self.bot.send_photo(chat_id=chat_id, photo=b)
