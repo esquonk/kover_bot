@@ -104,7 +104,7 @@ class KoverBot:
                 )),
                 op.switch_latest(),
                 op.flat_map(
-                    lambda message: asyncio.create_task(self.send_svalkopic(
+                    lambda message: asyncio.create_task(self.handle_svalkopic(
                         None, chat.chat_id, None
                     ))
                 ),
@@ -148,6 +148,7 @@ class KoverBot:
         messages.pipe(
             skip_some(60, 180, 60, 120, partition=lambda update: update.message.chat.id),
             op.flat_map(lambda update: asyncio.create_task(get_response(update))),
+            op.filter(lambda args: args[1]),
             op.flat_map(lambda args: asyncio.create_task(self.send_reply(args[0].message, args[1]))),
         ).subscribe(
             on_next=lambda _: None,
@@ -164,6 +165,7 @@ class KoverBot:
                 )
             )),
             op.flat_map(lambda update: asyncio.create_task(get_response(update))),
+            op.filter(lambda args: args[1]),
             op.flat_map(lambda args: asyncio.create_task(self.send_reply(args[0].message, args[1]))),
         ).subscribe(
             on_next=lambda _: None,
@@ -173,7 +175,7 @@ class KoverBot:
         # respond to #ptaag picture
         messages.pipe(
             op.filter(lambda update: bool(self.ptaag_re.match(update.message.text))),
-            op.flat_map(lambda update: asyncio.create_task(self.send_svalkopic(
+            op.flat_map(lambda update: asyncio.create_task(self.handle_svalkopic(
                 self.ptaag_re.findall(update.message.text or '')[0].strip('#'),
                 update.message.chat_id, update.message.message_id, True
             ))),
@@ -185,7 +187,7 @@ class KoverBot:
         # respond to anek
         messages.pipe(
             op.filter(lambda update: bool(self.anek_re.match(update.message.text))),
-            op.flat_map(lambda update: asyncio.create_task(self.send_anek(
+            op.flat_map(lambda update: asyncio.create_task(self.handle_anek(
                 update.message.chat_id, update.message.message_id
             ))),
         ).subscribe(
@@ -209,7 +211,7 @@ class KoverBot:
         # /svalkopic
         self.command_obs('svalkopic').pipe(
             op.flat_map(
-                lambda message: asyncio.create_task(self.send_svalkopic(
+                lambda message: asyncio.create_task(self.handle_svalkopic(
                     ''.join(message.text.split(maxsplit=1)[1:]).lower(),
                     message.chat_id, message.message_id
                 ))
@@ -222,7 +224,7 @@ class KoverBot:
         # /kament
         self.command_obs('kament').pipe(
             op.flat_map(
-                lambda message: asyncio.create_task(self.send_kament(message.chat_id))
+                lambda message: asyncio.create_task(self.handle_kament(message.chat_id))
             ),
             op.retry(3)
         ).subscribe(
@@ -281,12 +283,6 @@ class KoverBot:
         comment = random.choice(comments).find('div', {'class': 'text'})
         return comment.text
 
-    async def send_kament(self, chat_id):
-        logger.info(f"send_kament, chat_id={chat_id}")
-
-        kament = await self.get_kament()
-        await self.send_message(chat_id=chat_id, text=kament)
-
     async def send_reply(self, message, text):
         with handle_telegram_error():
             await message.reply_text(text)
@@ -295,22 +291,34 @@ class KoverBot:
         with handle_telegram_error():
             await self.bot.send_message(chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id)
 
-    async def send_anek(self, chat_id, reply_to_id):
-        logger.info(f"send_anek, chat_id={chat_id}, reply_to_id={reply_to_id}")
+    async def handle_kament(self, chat_id):
+        logger.info(f"send_kament, chat_id={chat_id}")
+        
+        await self.bot.send_chat_action(chat_id=chat_id, action="typing")
+        
+        kament = await self.get_kament()
+        await self.send_message(chat_id=chat_id, text=kament)
 
+    async def handle_anek(self, chat_id, reply_to_id):
+        logger.info(f"send_anek, chat_id={chat_id}, reply_to_id={reply_to_id}")
+        
+        await self.bot.send_chat_action(chat_id=chat_id, action="typing")
+        
         async with aiohttp.ClientSession() as session:
             async with session.get('http://baneks.ru/random') as response:
                 soup = BeautifulSoup(await response.read(), "html.parser")
-
+        
         anek = soup.find('section', {'class': 'anek-view'}).find('p').text
-
+        
         await self.send_message(chat_id=chat_id,
                                 reply_to_message_id=reply_to_id,
                                 text=anek)
 
-    async def send_svalkopic(self, tag_query, chat_id, reply_to_id, fail_silent=False):
+    async def handle_svalkopic(self, tag_query, chat_id, reply_to_id, fail_silent=False):
         logger.info(f"send_svalkopic, chat_id={chat_id}, reply_to_id={reply_to_id}")
-
+        
+        await self.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+        
         async with aiohttp.ClientSession() as session:
             if tag_query:
                 async with session.get("https://svalko.org/tags.html") as response:
