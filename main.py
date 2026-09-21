@@ -8,12 +8,16 @@ from kover_bot.bot2 import KoverBot
 
 async def main():
     load_dotenv()
-    bot = await KoverBot.create(token=os.getenv("TELEGRAM_TOKEN"))
-    await asyncio.gather(
-        bot.run(),
-    )
+    token = os.getenv("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+
+    bot = await KoverBot.create(token=token)
+    try:
+        await bot.run()
+    finally:
+        await bot.close()
 
 
-if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
+if __name__ == "__main__":
     asyncio.run(main())
