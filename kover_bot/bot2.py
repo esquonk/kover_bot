@@ -181,7 +181,13 @@ class KoverBot:
 
         # random response
         messages.pipe(
-            skip_some(60, 180, 60, 120, partition=lambda update: update.message.chat.id),
+            skip_some(
+                300,
+                1000,
+                30 * 60,
+                3 * 60 * 60,
+                partition=lambda update: update.message.chat.id,
+            ),
             op.flat_map(lambda update: self._task(get_response(update))),
             op.filter(lambda args: bool(args and args[1])),
             op.flat_map(lambda args: self._task(self.send_reply(args[0].message, args[1]))),
@@ -262,7 +268,7 @@ class KoverBot:
         logger.info("handle new chat %s %s", chat_id, username)
         chats = {**chats, chat_id: Chat(chat_id, username)}
         if username == "svalo4ka":
-            chats[chat_id].svalko_pic_period.on_next(3600)
+            chats[chat_id].svalko_pic_period.on_next(7200)
         self.chats.on_next(chats)
 
     async def get_updates_async(self):
