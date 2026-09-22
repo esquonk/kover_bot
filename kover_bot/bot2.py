@@ -4,8 +4,10 @@ import random
 import re
 import sys
 from asyncio import sleep
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from io import BytesIO
 from urllib.parse import urljoin
@@ -22,10 +24,22 @@ from reactivex.subject import BehaviorSubject, Subject
 from telegram import MessageEntity
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
+from kover_bot.response_selector import select_svalko_response
 from kover_bot.rx_utils import skip_some
 
 logger = logging.getLogger("root")
 logger.setLevel(logging.INFO)
+
+MAX_RECENT_MESSAGES = 20
+MESSAGE_CONTEXT_TTL = timedelta(hours=2)
+KAMENT_ROUND_SIZE = 30
+KAMENT_ROUND_COUNT = 6
+KAMENT_CANDIDATE_COUNT = KAMENT_ROUND_SIZE * KAMENT_ROUND_COUNT
+KAMENT_SOURCE_PAGE_COUNT = 6
+AUTOMATIC_KAMENT_MESSAGE_COUNT = 100
+AUTOMATIC_KAMENT_PERIOD = 60 * 60
+AUTOMATIC_KAMENT_MIN_CONFIDENCE = 0.5
+AUTO_MESSAGE_CHATS = ["svalo4ka"]
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
@@ -44,12 +58,42 @@ def handle_telegram_error():
 
 
 @dataclass
+class RecentMessage:
+    received_at: datetime
+    speaker: str
+    text: str
+
+
+@dataclass
 class Chat:
     chat_id: int
     username: str | None
     disposable: CompositeDisposable = field(default_factory=CompositeDisposable)
     svalko_pic_period: Subject = field(default_factory=partial(BehaviorSubject, value=None))
     is_configured: bool = False
+    recent_messages: deque[RecentMessage] = field(
+        default_factory=lambda: deque(maxlen=MAX_RECENT_MESSAGES)
+    )
+
+    def remember_message(
+        self, text: str, speaker: str = "Unknown", *, received_at: datetime | None = None
+    ):
+        text = text.strip()
+        if text:
+            self.recent_messages.append(
+                RecentMessage(received_at or datetime.now(UTC), speaker.strip() or "Unknown", text)
+            )
+
+    def recent_message_texts(self, *, now: datetime | None = None) -> list[str]:
+        return [message["text"] for message in self.recent_message_context(now=now)]
+
+    def recent_message_context(self, *, now: datetime | None = None) -> list[dict[str, str]]:
+        cutoff = (now or datetime.now(UTC)) - MESSAGE_CONTEXT_TTL
+        while self.recent_messages and self.recent_messages[0].received_at < cutoff:
+            self.recent_messages.popleft()
+        return [
+            {"speaker": message.speaker, "text": message.text} for message in self.recent_messages
+        ]
 
 
 class KoverBot:
@@ -65,10 +109,11 @@ class KoverBot:
         self.update_id: int | None = None
         self.bot: telegram.Bot
         self.session: aiohttp.ClientSession
+        self.jev_api_key: str | None = None
         self.disposable = CompositeDisposable()
 
     @classmethod
-    async def create(cls, token: str):
+    async def create(cls, token: str, jev_api_key: str | None = None):
         self = cls()
 
         logger.info("Starting...")
@@ -78,6 +123,9 @@ class KoverBot:
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=20),
         )
+        self.jev_api_key = jev_api_key
+        if not jev_api_key:
+            logger.warning("JEV_API_KEY is not set; responses will be selected randomly")
         return self
 
     async def close(self):
@@ -175,22 +223,35 @@ class KoverBot:
         messages = self.updates.pipe(
             op.filter(lambda update: bool(update.message and update.message.text)), op.share()
         )
+        self.disposable.add(messages.subscribe(on_next=self.remember_message))
 
         async def get_response(update):
-            return update, await self.get_kament()
+            return update, await self.select_kament(
+                update.message.chat.id,
+                message_to_answer=self.message_context(update.message),
+            )
 
-        # random response
+        # Only the main chat gets unsolicited comments. It needs both a quiet
+        # enough interval and enough new conversation before Jev may comment.
         messages.pipe(
+            op.filter(lambda update: self.is_auto_kament_chat(update.message.chat.id)),
             skip_some(
-                300,
-                1000,
-                30 * 60,
-                3 * 60 * 60,
+                # skip_some emits after its configured number of skipped values.
+                AUTOMATIC_KAMENT_MESSAGE_COUNT - 1,
+                AUTOMATIC_KAMENT_MESSAGE_COUNT - 1,
+                AUTOMATIC_KAMENT_PERIOD,
+                AUTOMATIC_KAMENT_PERIOD,
                 partition=lambda update: update.message.chat.id,
             ),
-            op.flat_map(lambda update: self._task(get_response(update))),
-            op.filter(lambda args: bool(args and args[1])),
-            op.flat_map(lambda args: self._task(self.send_reply(args[0].message, args[1]))),
+            op.flat_map(
+                lambda update: self._task(self.select_automatic_kament(update.message.chat.id))
+            ),
+            op.filter(lambda response: bool(response)),
+            op.flat_map(
+                lambda response: self._task(
+                    self.send_message(chat_id=response[0], text=response[1])
+                )
+            ),
         ).subscribe(on_next=lambda _: None, scheduler=scheduler)
 
         # respond to me or to replies on my posts
@@ -260,7 +321,7 @@ class KoverBot:
 
         # /kament
         self.command_obs("kament").pipe(
-            op.flat_map(lambda message: self._task(self.handle_kament(message.chat_id))),
+            op.flat_map(lambda message: self._task(self.handle_kament(message))),
             op.retry(3),
         ).subscribe(on_next=lambda _: None, scheduler=scheduler)
 
@@ -270,6 +331,39 @@ class KoverBot:
         if username == "svalo4ka":
             chats[chat_id].svalko_pic_period.on_next(7200)
         self.chats.on_next(chats)
+
+    def is_auto_kament_chat(self, chat_id: int) -> bool:
+        chat = self.chats.value.get(chat_id)
+        return bool(chat and chat.username in AUTO_MESSAGE_CHATS)
+
+    def remember_message(self, update):
+        message = update.message
+        chat = self.chats.value.get(message.chat.id)
+        if chat is None:
+            return
+        if message.from_user and message.from_user.id == self.bot.id:
+            return
+        if any(
+            entity.type == MessageEntity.BOT_COMMAND and entity.offset == 0
+            for entity in message.entities or ()
+        ):
+            return
+        chat.remember_message(message.text, self.message_context(message)["speaker"])
+
+    @staticmethod
+    def message_context(message) -> dict[str, str]:
+        user = message.from_user
+        sender_chat = getattr(message, "sender_chat", None)
+        speaker = (
+            getattr(user, "full_name", None)
+            or getattr(user, "username", None)
+            or getattr(sender_chat, "title", None)
+            or "Unknown"
+        )
+        return {
+            "speaker": speaker,
+            "text": message.text or getattr(message, "caption", None) or "",
+        }
 
     async def get_updates_async(self):
         while True:
@@ -294,22 +388,100 @@ class KoverBot:
             await sleep(0.1)
             self.updates.on_next(update)
 
-    async def get_kament(self) -> str:
-        for attempt in range(10):
-            try:
-                soup = await self._get_soup("https://svalko.org/random.html")
-                comments = [
-                    text.get_text(" ", strip=True)
-                    for comment in soup.select("div.comment")
-                    if (text := comment.select_one("div.text")) is not None
-                    and 0 < len(text.get_text(strip=True)) < 500
-                ]
-                if comments:
-                    return random.choice(comments)
-            except aiohttp.ClientError:
-                logger.warning("Could not fetch a comment (attempt %s/10)", attempt + 1)
-            await asyncio.sleep(1)
-        return ""
+    async def get_kament_candidates(self) -> list[str]:
+        results = await asyncio.gather(
+            *(
+                self._get_soup(
+                    f"https://svalko.org/random.html?rand={random.randint(0, 100_000_000)}"
+                )
+                for _ in range(KAMENT_SOURCE_PAGE_COUNT)
+            ),
+            return_exceptions=True,
+        )
+        comments = []
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("Could not fetch candidate comments", exc_info=result)
+                continue
+            comments.extend(
+                text.get_text(" ", strip=True)
+                for comment in result.select("div.comment")
+                if (text := comment.select_one("div.text")) is not None
+                and 0 < len(text.get_text(strip=True)) < 500
+            )
+
+        comments = list(dict.fromkeys(comments))
+        if len(comments) > KAMENT_CANDIDATE_COUNT:
+            return random.sample(comments, KAMENT_CANDIDATE_COUNT)
+        return comments
+
+    async def select_kament(
+        self, chat_id: int, *, message_to_answer: dict[str, str] | None = None
+    ) -> str:
+        candidates = await self.get_kament_candidates()
+        if not candidates:
+            return ""
+
+        chat = self.chats.value.get(chat_id)
+        context = chat.recent_message_context() if chat else []
+        if message_to_answer and context and context[-1] == message_to_answer:
+            context = context[:-1]
+        if not self.jev_api_key:
+            return random.choice(candidates)
+
+        random.shuffle(candidates)
+        groups = [
+            candidates[start : start + KAMENT_ROUND_SIZE]
+            for start in range(0, len(candidates), KAMENT_ROUND_SIZE)
+        ][:KAMENT_ROUND_COUNT]
+        preliminary = await asyncio.gather(
+            *(
+                select_svalko_response(
+                    context,
+                    group,
+                    api_key=self.jev_api_key,
+                    session=self.session,
+                    message_to_answer=message_to_answer,
+                )
+                for group in groups
+            )
+        )
+        finalists = [(response, confidence) for response, confidence in preliminary if response]
+        if finalists:
+            return max(finalists, key=lambda finalist: finalist[1])[0]
+        return random.choice(candidates)
+
+    async def select_automatic_kament(self, chat_id: int) -> tuple[int, str] | None:
+        """Return an unsolicited comment only when Jev endorses it strongly."""
+        if not self.jev_api_key:
+            return None
+
+        candidates = await self.get_kament_candidates()
+        if not candidates:
+            return None
+        chat = self.chats.value.get(chat_id)
+        context = chat.recent_message_context() if chat else []
+
+        random.shuffle(candidates)
+        groups = [
+            candidates[start : start + KAMENT_ROUND_SIZE]
+            for start in range(0, len(candidates), KAMENT_ROUND_SIZE)
+        ][:KAMENT_ROUND_COUNT]
+        preliminary = await asyncio.gather(
+            *(
+                select_svalko_response(
+                    context, group, api_key=self.jev_api_key, session=self.session
+                )
+                for group in groups
+            )
+        )
+        finalists = [(response, confidence) for response, confidence in preliminary if response]
+        if not finalists:
+            return None
+        winner, confidence = max(finalists, key=lambda finalist: finalist[1])
+        if winner and confidence > AUTOMATIC_KAMENT_MIN_CONFIDENCE:
+            return chat_id, winner
+        return None
 
     async def send_reply(self, message, text):
         with handle_telegram_error():
@@ -321,12 +493,16 @@ class KoverBot:
                 chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id
             )
 
-    async def handle_kament(self, chat_id):
+    async def handle_kament(self, message):
+        chat_id = message.chat_id
         logger.info(f"send_kament, chat_id={chat_id}")
 
         await self.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-        kament = await self.get_kament()
+        target = (
+            self.message_context(message.reply_to_message) if message.reply_to_message else None
+        )
+        kament = await self.select_kament(chat_id, message_to_answer=target)
         if kament:
             await self.send_message(chat_id=chat_id, text=kament)
 

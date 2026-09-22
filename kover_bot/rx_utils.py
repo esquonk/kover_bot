@@ -12,10 +12,12 @@ def skip_some(
     min_time: float,
     max_time: float,
     partition: Callable[[Any], Hashable],
+    require_all: bool = True,
 ):
     """
-    Skip between min_skip and max_skip values, and between min_time and max_time seconds,
-    whichever comes last, then reset the counters.
+    Skip between min_skip and max_skip values and wait between min_time and
+    max_time seconds, then reset the counters. By default both limits must be
+    reached. Set ``require_all=False`` to emit when either limit is reached.
     """
 
     if min_skip < 0 or min_skip > max_skip:
@@ -46,9 +48,15 @@ def skip_some(
                     _reset_stats(partition_key)
 
                 state = stats[partition_key]
-                if state["skipped"] < state["to_skip"]:
-                    state["skipped"] += 1
-                elif state["last_message"] + state["to_wait"] <= time():
+                state["skipped"] += 1
+                count_ready = (
+                    state["skipped"] > state["to_skip"]
+                    if require_all
+                    else state["skipped"] >= state["to_skip"]
+                )
+                time_ready = state["last_message"] + state["to_wait"] <= time()
+                ready = (count_ready and time_ready) if require_all else (count_ready or time_ready)
+                if ready:
                     observer.on_next(value)
                     _reset_stats(partition_key)
 
