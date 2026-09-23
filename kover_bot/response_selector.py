@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 JEV_DECISIONS_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-latest"
 MAX_CONTEXT_MESSAGES = 20
-MAX_CANDIDATES = 30
+MAX_CANDIDATES = 50
 MAX_TEXT_LENGTH = 500
 MAX_REQUEST_BYTES = 100_000
 
@@ -100,14 +100,15 @@ def _build_payload(
     instructions = (
         "Choose the most logical, natural, and funny option that matches the recent chat."
         " Focus on semantics first. But try to consider the morphology of the dialogue."
-        " If none of the listed options are suitable enough, choose a neutral statement."
+        " If none of the listed options are suitable enough, choose a neutral statement." +
+        (" Prioritize direct responses for the message in message_to_answer." if message_to_answer else "")
     )
     return {
         "model": JEV_MODEL,
         "state": {
             "chat_history": context,
             "message_to_answer": (
-                _normalize_message(message_to_answer) if message_to_answer else None
+
             ),
         },
         "questions": {
@@ -131,10 +132,10 @@ def _fit_payload(
     payload = _build_payload(context, choices, message_to_answer=message_to_answer)
 
     while len(json.dumps(payload).encode()) > MAX_REQUEST_BYTES:
-        if context:
-            context.pop(0)
-        elif len(choices) > 2:
+        if len(choices) > 2:
             choices = choices[:-1]
+        elif context:
+            context.pop(0)
         else:
             raise ValueError("candidate payload is too large for Jev")
         payload = _build_payload(context, choices, message_to_answer=message_to_answer)

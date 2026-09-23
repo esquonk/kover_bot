@@ -1,4 +1,4 @@
- import asyncio
+import asyncio
 import json
 import logging
 
@@ -79,6 +79,18 @@ def test_fit_payload_obeys_jev_request_limit():
 
     assert len(json.dumps(payload).encode()) <= MAX_REQUEST_BYTES
     assert len(candidates) >= 2
+
+
+def test_fit_payload_drops_candidates_before_chat_history():
+    history = ["🚀" * 500 for _ in range(10)]
+    candidates, payload = _fit_payload(
+        history,
+        [f"{index}:" + "🚀" * 500 for index in range(50)],
+    )
+
+    assert len(json.dumps(payload).encode()) <= MAX_REQUEST_BYTES
+    assert 2 < len(candidates) < 50
+    assert len(payload["state"]["chat_history"]) == len(history)
 
 
 def test_selects_using_jev_choice_and_confidence():

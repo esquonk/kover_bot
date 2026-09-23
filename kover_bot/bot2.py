@@ -5,7 +5,7 @@ import re
 import sys
 from asyncio import sleep
 from collections import deque
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -32,13 +32,15 @@ logger.setLevel(logging.INFO)
 
 MAX_RECENT_MESSAGES = 20
 MESSAGE_CONTEXT_TTL = timedelta(hours=2)
-KAMENT_ROUND_SIZE = 30
-KAMENT_ROUND_COUNT = 6
-KAMENT_CANDIDATE_COUNT = KAMENT_ROUND_SIZE * KAMENT_ROUND_COUNT
-KAMENT_SOURCE_PAGE_COUNT = 6
+KAMENT_ROUND_SIZE = 50
+KAMENT_MAX_ROUNDS = 10
+KAMENT_MIN_CONFIDENCE = 0.5
+KAMENT_SOURCE_PAGE_COUNT = 3
+KAMENT_MAX_FETCHES_PER_ROUND = 3
+# Telegram clears a chat action after about 5 seconds.
+CHAT_ACTION_REFRESH_PERIOD = 4
 AUTOMATIC_KAMENT_MESSAGE_COUNT = 100
 AUTOMATIC_KAMENT_PERIOD = 60 * 60
-AUTOMATIC_KAMENT_MIN_CONFIDENCE = 0.5
 AUTO_MESSAGE_CHATS = ["svalo4ka"]
 
 logging.basicConfig(
@@ -225,12 +227,6 @@ class KoverBot:
         )
         self.disposable.add(messages.subscribe(on_next=self.remember_message))
 
-        async def get_response(update):
-            return update, await self.select_kament(
-                update.message.chat.id,
-                message_to_answer=self.message_context(update.message),
-            )
-
         # Only the main chat gets unsolicited comments. It needs both a quiet
         # enough interval and enough new conversation before Jev may comment.
         messages.pipe(
@@ -265,9 +261,7 @@ class KoverBot:
                     )
                 )
             ),
-            op.flat_map(lambda update: self._task(get_response(update))),
-            op.filter(lambda args: bool(args and args[1])),
-            op.flat_map(lambda args: self._task(self.send_reply(args[0].message, args[1]))),
+            op.flat_map(lambda update: self._task(self.handle_mention(update.message))),
         ).subscribe(on_next=lambda _: None, scheduler=scheduler)
 
         # respond to #ptaag picture
@@ -408,78 +402,87 @@ class KoverBot:
                 for comment in result.select("div.comment")
                 if (text := comment.select_one("div.text")) is not None
                 and 0 < len(text.get_text(strip=True)) < 500
+                # Comment pagination is rendered as a comment: "насрано N раз: [0] [1] ..."
+                and "[0]" not in text.get_text()
             )
 
-        comments = list(dict.fromkeys(comments))
-        if len(comments) > KAMENT_CANDIDATE_COUNT:
-            return random.sample(comments, KAMENT_CANDIDATE_COUNT)
-        return comments
+        return list(dict.fromkeys(comments))
+
+    async def _select_best_kament(
+        self, context: list[dict[str, str]], message_to_answer: dict[str, str] | None = None
+    ) -> tuple[str, float, list[str]]:
+        """Run Jev passes over fresh candidates until one is confident enough.
+
+        Returns the best response, its confidence, and every candidate seen.
+        """
+        seen: list[str] = []
+        pool: list[str] = []
+        best, best_confidence = "", 0.0
+        jev_requests = page_fetches = tried = 0
+        for _ in range(KAMENT_MAX_ROUNDS):
+            for _ in range(KAMENT_MAX_FETCHES_PER_ROUND):
+                if len(pool) >= KAMENT_ROUND_SIZE:
+                    break
+                page_fetches += 1
+                fresh = [c for c in await self.get_kament_candidates() if c not in seen]
+                seen.extend(fresh)
+                pool.extend(fresh)
+            if not pool:
+                break
+
+            group, pool = pool[:KAMENT_ROUND_SIZE], pool[KAMENT_ROUND_SIZE:]
+            jev_requests += 1
+            tried += len(group)
+            response, confidence = await select_svalko_response(
+                context,
+                group,
+                api_key=self.jev_api_key,
+                session=self.session,
+                message_to_answer=message_to_answer,
+            )
+            if response and (not best or confidence > best_confidence):
+                best, best_confidence = response, confidence
+            if best_confidence > KAMENT_MIN_CONFIDENCE:
+                break
+        if best:
+            logger.info(
+                "Picked kament: response=%r confidence=%s jev_requests=%s page_fetches=%s"
+                " candidates_tried=%s",
+                best,
+                best_confidence,
+                jev_requests,
+                page_fetches * KAMENT_SOURCE_PAGE_COUNT,
+                tried,
+            )
+        return best, best_confidence, seen
 
     async def select_kament(
         self, chat_id: int, *, message_to_answer: dict[str, str] | None = None
     ) -> str:
-        candidates = await self.get_kament_candidates()
-        if not candidates:
-            return ""
+        if not self.jev_api_key:
+            candidates = await self.get_kament_candidates()
+            return random.choice(candidates) if candidates else ""
 
         chat = self.chats.value.get(chat_id)
         context = chat.recent_message_context() if chat else []
         if message_to_answer and context and context[-1] == message_to_answer:
             context = context[:-1]
-        if not self.jev_api_key:
-            return random.choice(candidates)
 
-        random.shuffle(candidates)
-        groups = [
-            candidates[start : start + KAMENT_ROUND_SIZE]
-            for start in range(0, len(candidates), KAMENT_ROUND_SIZE)
-        ][:KAMENT_ROUND_COUNT]
-        preliminary = await asyncio.gather(
-            *(
-                select_svalko_response(
-                    context,
-                    group,
-                    api_key=self.jev_api_key,
-                    session=self.session,
-                    message_to_answer=message_to_answer,
-                )
-                for group in groups
-            )
-        )
-        finalists = [(response, confidence) for response, confidence in preliminary if response]
-        if finalists:
-            return max(finalists, key=lambda finalist: finalist[1])[0]
-        return random.choice(candidates)
+        best, _, candidates = await self._select_best_kament(context, message_to_answer)
+        if best:
+            return best
+        return random.choice(candidates) if candidates else ""
 
     async def select_automatic_kament(self, chat_id: int) -> tuple[int, str] | None:
         """Return an unsolicited comment only when Jev endorses it strongly."""
         if not self.jev_api_key:
             return None
 
-        candidates = await self.get_kament_candidates()
-        if not candidates:
-            return None
         chat = self.chats.value.get(chat_id)
         context = chat.recent_message_context() if chat else []
 
-        random.shuffle(candidates)
-        groups = [
-            candidates[start : start + KAMENT_ROUND_SIZE]
-            for start in range(0, len(candidates), KAMENT_ROUND_SIZE)
-        ][:KAMENT_ROUND_COUNT]
-        preliminary = await asyncio.gather(
-            *(
-                select_svalko_response(
-                    context, group, api_key=self.jev_api_key, session=self.session
-                )
-                for group in groups
-            )
-        )
-        finalists = [(response, confidence) for response, confidence in preliminary if response]
-        if not finalists:
-            return None
-        winner, confidence = max(finalists, key=lambda finalist: finalist[1])
-        if winner and confidence > AUTOMATIC_KAMENT_MIN_CONFIDENCE:
+        winner, confidence, _ = await self._select_best_kament(context)
+        if winner and confidence > KAMENT_MIN_CONFIDENCE:
             return chat_id, winner
         return None
 
@@ -493,18 +496,46 @@ class KoverBot:
                 chat_id=chat_id, text=text, reply_to_message_id=reply_to_message_id
             )
 
+    @asynccontextmanager
+    async def keep_chat_action(self, chat_id, action="typing"):
+        """Keep showing a chat action until the block finishes."""
+
+        async def refresh():
+            while True:
+                try:
+                    await self.bot.send_chat_action(chat_id=chat_id, action=action)
+                except NetworkError, RetryAfter:
+                    logger.warning("Could not send chat action", exc_info=True)
+                await sleep(CHAT_ACTION_REFRESH_PERIOD)
+
+        task = asyncio.create_task(refresh())
+        try:
+            yield
+        finally:
+            task.cancel()
+
     async def handle_kament(self, message):
         chat_id = message.chat_id
         logger.info(f"send_kament, chat_id={chat_id}")
 
-        await self.bot.send_chat_action(chat_id=chat_id, action="typing")
-
         target = (
             self.message_context(message.reply_to_message) if message.reply_to_message else None
         )
-        kament = await self.select_kament(chat_id, message_to_answer=target)
-        if kament:
-            await self.send_message(chat_id=chat_id, text=kament)
+        async with self.keep_chat_action(chat_id):
+            kament = await self.select_kament(chat_id, message_to_answer=target)
+            if kament:
+                await self.send_message(chat_id=chat_id, text=kament)
+
+    async def handle_mention(self, message):
+        chat_id = message.chat_id
+        logger.info(f"reply_to_mention, chat_id={chat_id}")
+
+        async with self.keep_chat_action(chat_id):
+            kament = await self.select_kament(
+                chat_id, message_to_answer=self.message_context(message)
+            )
+            if kament:
+                await self.send_reply(message, kament)
 
     async def handle_anek(self, chat_id, reply_to_id):
         logger.info(f"send_anek, chat_id={chat_id}, reply_to_id={reply_to_id}")

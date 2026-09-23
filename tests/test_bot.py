@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -7,9 +8,9 @@ from bs4 import BeautifulSoup
 from telegram import MessageEntity
 
 from kover_bot.bot2 import (
-    KAMENT_CANDIDATE_COUNT,
-    KAMENT_ROUND_COUNT,
+    KAMENT_MAX_ROUNDS,
     KAMENT_ROUND_SIZE,
+    KAMENT_SOURCE_PAGE_COUNT,
     MAX_RECENT_MESSAGES,
     Chat,
     KoverBot,
@@ -118,6 +119,24 @@ def test_get_kament_candidates_collects_unique_comments():
     assert asyncio.run(bot.get_kament_candidates()) == ["first", "second"]
 
 
+def test_get_kament_candidates_skips_comment_pagination():
+    bot = KoverBot()
+
+    async def get_soup(_):
+        return BeautifulSoup(
+            """
+            <div class="comment"><div class="text">real comment [1]</div></div>
+            <div class="comment"><div class="text">насрано 60 раз:<br>
+            <a href="/1.html?page=0#c">[0]</a><a href="/1.html?page=1#c">[1]</a></div></div>
+            """,
+            "html.parser",
+        )
+
+    bot._get_soup = get_soup
+
+    assert asyncio.run(bot.get_kament_candidates()) == ["real comment [1]"]
+
+
 def test_select_kament_uses_chat_context_and_jev(monkeypatch):
     bot = KoverBot()
     bot.jev_api_key = "test-key"
@@ -148,30 +167,98 @@ def test_select_kament_uses_chat_context_and_jev(monkeypatch):
     }
 
 
-def test_select_kament_uses_the_highest_confidence_bracket_winner(monkeypatch):
+def _paged_candidates(bot, page_size):
+    """Make every candidate fetch return a fresh page of candidates."""
+    fetches = 0
+
+    async def get_candidates():
+        nonlocal fetches
+        start = fetches * page_size
+        fetches += 1
+        return [f"candidate {index}" for index in range(start, start + page_size)]
+
+    bot.get_kament_candidates = get_candidates
+    return lambda: fetches
+
+
+def test_select_kament_stops_after_a_confident_pass(monkeypatch):
     bot = KoverBot()
     bot.jev_api_key = "test-key"
     bot.session = object()
-    candidates = [f"candidate {index}" for index in range(KAMENT_CANDIDATE_COUNT)]
-
-    async def get_candidates():
-        return candidates.copy()
-
+    fetches = _paged_candidates(bot, 20)
     calls = []
 
     async def select_response(context, round_candidates, **kwargs):
-        calls.append((context, round_candidates, kwargs))
-        return round_candidates[0], len(calls) / 10
+        calls.append(round_candidates)
+        return round_candidates[0], 0.8
 
-    bot.get_kament_candidates = get_candidates
     monkeypatch.setattr("kover_bot.bot2.select_svalko_response", select_response)
-    monkeypatch.setattr("kover_bot.bot2.random.shuffle", lambda _: None)
+
+    assert asyncio.run(bot.select_kament(123)) == "candidate 0"
+    assert [len(call) for call in calls] == [KAMENT_ROUND_SIZE]
+    assert fetches() == 3
+
+
+def test_select_kament_logs_the_picked_response(monkeypatch, caplog):
+    bot = KoverBot()
+    bot.jev_api_key = "test-key"
+    bot.session = object()
+    _paged_candidates(bot, 30)
+    confidences = [0.3, 0.7]
+
+    async def select_response(context, round_candidates, **kwargs):
+        return round_candidates[0], confidences.pop(0)
+
+    monkeypatch.setattr("kover_bot.bot2.select_svalko_response", select_response)
+
+    with caplog.at_level(logging.INFO, logger="root"):
+        asyncio.run(bot.select_kament(123))
+
+    assert (
+        "Picked kament: response='candidate 50' confidence=0.7 jev_requests=2"
+        f" page_fetches={4 * KAMENT_SOURCE_PAGE_COUNT} candidates_tried=100"
+    ) in caplog.text
+
+
+def test_select_kament_repeats_passes_and_picks_the_best(monkeypatch):
+    bot = KoverBot()
+    bot.jev_api_key = "test-key"
+    bot.session = object()
+    _paged_candidates(bot, 20)
+    calls = []
+    confidences = [0.2, 0.4, 0.3] + [0.1] * (KAMENT_MAX_ROUNDS - 3)
+
+    async def select_response(context, round_candidates, **kwargs):
+        calls.append(round_candidates)
+        return round_candidates[0], confidences[len(calls) - 1]
+
+    monkeypatch.setattr("kover_bot.bot2.select_svalko_response", select_response)
 
     selected = asyncio.run(bot.select_kament(123))
 
-    assert selected == f"candidate {KAMENT_ROUND_SIZE * (KAMENT_ROUND_COUNT - 1)}"
-    assert [len(call[1]) for call in calls] == [KAMENT_ROUND_SIZE] * KAMENT_ROUND_COUNT
-    assert all(call[2]["message_to_answer"] is None for call in calls)
+    assert len(calls) == KAMENT_MAX_ROUNDS
+    assert all(len(call) == KAMENT_ROUND_SIZE for call in calls)
+    # Leftover candidates carry over, so no candidate is offered twice.
+    offered = [candidate for call in calls for candidate in call]
+    assert len(offered) == len(set(offered))
+    assert selected == calls[1][0]
+
+
+def test_select_kament_falls_back_to_random_when_jev_fails(monkeypatch):
+    bot = KoverBot()
+    bot.jev_api_key = "test-key"
+    bot.session = object()
+
+    async def get_candidates():
+        return ["only"]
+
+    async def select_response(context, round_candidates, **kwargs):
+        return "", 0.0
+
+    bot.get_kament_candidates = get_candidates
+    monkeypatch.setattr("kover_bot.bot2.select_svalko_response", select_response)
+
+    assert asyncio.run(bot.select_kament(123)) == "only"
 
 
 def test_select_automatic_kament_uses_confident_finalist(monkeypatch):
@@ -238,3 +325,60 @@ def test_kament_command_uses_replied_to_message_as_target():
         {"speaker": "Alice", "text": "the specific message"},
     )
     bot.send_message.assert_awaited_once_with(chat_id=123, text="selected response")
+
+
+def test_kament_command_keeps_typing_while_searching(monkeypatch):
+    monkeypatch.setattr("kover_bot.bot2.CHAT_ACTION_REFRESH_PERIOD", 0.01)
+    bot = KoverBot()
+    bot.bot = SimpleNamespace(send_chat_action=AsyncMock())
+    bot.send_message = AsyncMock()
+
+    async def select_kament(chat_id, *, message_to_answer=None):
+        await asyncio.sleep(0.05)
+        return "selected response"
+
+    bot.select_kament = select_kament
+
+    async def run():
+        await bot.handle_kament(SimpleNamespace(chat_id=123, reply_to_message=None))
+        calls = bot.bot.send_chat_action.await_count
+        await asyncio.sleep(0.05)
+        return calls
+
+    calls_during_search = asyncio.run(run())
+
+    assert calls_during_search >= 3
+    # Typing stops once the reply has been sent.
+    assert bot.bot.send_chat_action.await_count == calls_during_search
+    bot.bot.send_chat_action.assert_awaited_with(chat_id=123, action="typing")
+    bot.send_message.assert_awaited_once_with(chat_id=123, text="selected response")
+
+
+def test_mention_reply_keeps_typing_while_searching(monkeypatch):
+    monkeypatch.setattr("kover_bot.bot2.CHAT_ACTION_REFRESH_PERIOD", 0.01)
+    bot = KoverBot()
+    bot.bot = SimpleNamespace(send_chat_action=AsyncMock())
+    bot.send_reply = AsyncMock()
+    selected_with = None
+
+    async def select_kament(chat_id, *, message_to_answer=None):
+        nonlocal selected_with
+        selected_with = (chat_id, message_to_answer)
+        await asyncio.sleep(0.05)
+        return "selected response"
+
+    bot.select_kament = select_kament
+    message = SimpleNamespace(
+        chat_id=123,
+        text="ковробот, привет",
+        caption=None,
+        from_user=SimpleNamespace(full_name="Alice", username="alice"),
+        sender_chat=None,
+    )
+
+    asyncio.run(bot.handle_mention(message))
+
+    assert bot.bot.send_chat_action.await_count >= 3
+    bot.bot.send_chat_action.assert_awaited_with(chat_id=123, action="typing")
+    assert selected_with == (123, {"speaker": "Alice", "text": "ковробот, привет"})
+    bot.send_reply.assert_awaited_once_with(message, "selected response")
