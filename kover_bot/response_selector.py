@@ -108,7 +108,7 @@ def _build_payload(
         "state": {
             "chat_history": context,
             "message_to_answer": (
-
+                _normalize_message(message_to_answer) if message_to_answer else None
             ),
         },
         "questions": {
